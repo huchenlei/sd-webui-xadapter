@@ -10,7 +10,7 @@ import torch
 from scripts.logging import logger
 from scripts.lib_xadapter.adapter import Adapter_XL
 from modules import scripts, sd_models, sd_samplers, paths
-from modules.processing import StableDiffusionProcessing, process_images
+from modules.processing import StableDiffusionProcessing, process_images, Processed
 
 IS_XADAPTER_PASS_FLAG = "is_xadapter_preprocess_pass"
 MODELS_DIR = os.path.join(paths.models_path, "xadapter")
@@ -60,47 +60,16 @@ def hook_module_input(module: torch.nn.Module, i: int, out_dict: dict):
     module.register_forward_hook(hook)
 
 
-def get_hidden_states(
-    p: StableDiffusionProcessing, adapter_args: XAdapterArgs
-) -> List[List[torch.Tensor]]:
-    """Run SD1.5 generation to get hidden states."""
-    # Do SD1.5 pass
-    p2 = copy(p)
-    # Mark the process as xadapter pass, so that we do not fall into infinite loop.
-    setattr(p2, IS_XADAPTER_PASS_FLAG, True)
-    p2.width = adapter_args.width
-    p2.height = adapter_args.height
-    p2.sampler = adapter_args.sampler
-    p2.override_settings = copy(p.override_settings)
-    p2.override_settings["sd_model_checkpoint"] = adapter_args.checkpoint
-
-    # Key is up-block num
-    # Inner list indices are denoising timesteps.
-    hidden_states = defaultdict(list)
-    # Note: skip the first output_block as its input is the output of
-    # middle block.
-    sd_ldm = p2.sd_model
-    unet = sd_ldm.model.diffusion_model
-    for i, block in enumerate(unet.output_blocks[1:] + [unet.out]):
-        hook_module_input(block, i, hidden_states)
-    try:
-        process_images(p2)
-    finally:
-        p2.close()
-        hidden_states.clear()
-    return [hidden_states[i] for i in range(len(hidden_states))]
-
-
-class UpBlocksModifier(torch.nn.Module):
+class UpLayerModifier(torch.nn.Module):
     def __init__(
-        self, original_block: torch.nn.Module, extra_residuals: List[torch.Tensor]
+        self, original_layer: torch.nn.Module, extra_residuals: List[torch.Tensor]
     ) -> None:
         super().__init__()
-        self.original_block = original_block
+        self.original_layer = original_layer
         self.extra_residuals = extra_residuals
 
     def forward(self, *args, **kwargs):
-        original_output = self.original_block(*args, **kwargs)
+        original_output = self.original_layer(*args, **kwargs)
         if self.extra_residuals:
             original_output += self.extra_residuals.pop()
         else:
@@ -158,36 +127,93 @@ class Script(scripts.Script):
             )
         return enabled, model, sampler, width, height, start, scale
 
+    @staticmethod
+    def run_sd15(p: StableDiffusionProcessing, adapter_args: XAdapterArgs) -> Processed:
+        """Run SD1.5 generation to get hidden states."""
+        p2 = copy(p)
+        # Mark the process as xadapter pass, so that we do not fall into infinite loop.
+        setattr(p2, IS_XADAPTER_PASS_FLAG, True)
+        p2.width = adapter_args.width
+        p2.height = adapter_args.height
+        p2.sampler = adapter_args.sampler
+        p2.override_settings = copy(p.override_settings)
+        p2.override_settings["sd_model_checkpoint"] = adapter_args.checkpoint
+
+        try:
+            processed = process_images(p2)
+        finally:
+            p2.close()
+        return processed
+
     def process(self, p: StableDiffusionProcessing, *args):
         """
         This function is called before processing begins for AlwaysVisible scripts.
         You can modify the processing object (p) here, inject hooks, etc.
         args contains all values returned by components from ui()
-
         """
+        # Key is up-block num
+        # Inner list indices are denoising timesteps.
+        self.hidden_states = defaultdict(list)
+
         adapter_args = XAdapterArgs(*args)
-        if not adapter_args.enabled or getattr(p, IS_XADAPTER_PASS_FLAG, False):
+        if not adapter_args.enabled:
             return
-
-        # Apply X-Adapter
-        hidden_states_by_timesteps = []
-        if Script.adapter is None:
-            Script.adapter = load_xadapter(MODEL_FILE)
-        # Transpose the matrix.
-        for hidden_states in zip(*get_hidden_states(p, adapter_args)):
-            # hidden states tensor * num of blocks
-            hidden_states_by_timesteps.append(Script.adapter(hidden_states))
-        # Transpose back.
-        hidden_states_by_blocks = list(zip(*hidden_states_by_timesteps))
-
         sd_ldm = p.sd_model
         unet = sd_ldm.model.diffusion_model
-        new_output_blocks = torch.nn.ModuleList()
-        for hidden_states, block in zip(
-            unet.output_blocks,
-            hidden_states_by_blocks,
-        ):
-            new_output_blocks = UpBlocksModifier(
-                block, extra_residuals=hidden_states[::-1]
-            )
-        unet.output_blocks = new_output_blocks
+
+        if getattr(p, IS_XADAPTER_PASS_FLAG, False):
+            # SD15 pass.
+            # Collect hidden_states of last 3 upsample blocks.
+            for i, layer in enumerate(
+                [
+                    unet.output_blocks[7],
+                    unet.output_blocks[10],
+                    unet.out,
+                ]
+            ):
+                hook_module_input(layer, i, self.hidden_states)
+        else:
+            Script.run_sd15(p, adapter_args)
+            # SDXL pass.
+            # Apply X-Adapter
+            if Script.adapter is None:
+                Script.adapter = load_xadapter(MODEL_FILE)
+                Script.adapter.to(device="cuda")
+            hidden_states_by_timesteps = []
+            # Convert defaultdict to matrix.
+            hidden_statess = [
+                self.hidden_states[i] for i in range(len(self.hidden_states))
+            ]
+            # Transpose the matrix.
+            for hidden_states in zip(*hidden_statess):
+                assert (
+                    len(hidden_states) == 3
+                ), "Should collect last three up blk in SD1.5"
+                # hidden states tensor * num of blocks
+                hidden_states_by_timesteps.append(Script.adapter(hidden_states))
+            # Transpose back.
+            hidden_states_by_blocks = list(zip(*hidden_states_by_timesteps))
+
+            sd_ldm = p.sd_model
+            unet = sd_ldm.model.diffusion_model
+            new_output_blocks = torch.nn.ModuleList()
+            for hidden_states, block in zip(
+                unet.output_blocks,
+                hidden_states_by_blocks,
+            ):
+                new_output_blocks.append(
+                    UpLayerModifier(block, extra_residuals=hidden_states[::-1])
+                )
+            unet.output_blocks = new_output_blocks
+
+    def postprocess(self, p, processed, *args):
+        """
+        This function is called after processing ends for AlwaysVisible scripts.
+        args contains all values returned by components from ui()
+        """
+        adapter_args = XAdapterArgs(*args)
+        if not adapter_args.enabled:
+            return
+        if not getattr(p, IS_XADAPTER_PASS_FLAG, False):
+            assert hasattr(self, "hidden_states")
+            self.hidden_states.clear()
