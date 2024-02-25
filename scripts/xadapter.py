@@ -2,12 +2,12 @@ import os
 from dataclasses import dataclass
 from copy import copy
 from collections import defaultdict
-from typing import List
+from typing import List, Callable
 
 import gradio as gr
 import torch
 
-from scripts.logging import logger
+from scripts.lib_xadapter.logging import logger
 from scripts.lib_xadapter.adapter import Adapter_XL
 from modules import scripts, sd_models, sd_samplers, paths
 from modules.processing import StableDiffusionProcessing, process_images, Processed
@@ -60,21 +60,51 @@ def hook_module_input(module: torch.nn.Module, i: int, out_dict: dict):
     module.register_forward_hook(hook)
 
 
-class UpLayerModifier(torch.nn.Module):
+class ResidualModifier(torch.nn.Module):
     def __init__(
-        self, original_layer: torch.nn.Module, extra_residuals: List[torch.Tensor]
+        self,
+        original_layer: torch.nn.Module,
+        extra_residuals: Callable[[], torch.Tensor],
     ) -> None:
         super().__init__()
         self.original_layer = original_layer
         self.extra_residuals = extra_residuals
 
     def forward(self, *args, **kwargs):
-        original_output = self.original_layer(*args, **kwargs)
-        if self.extra_residuals:
-            original_output += self.extra_residuals.pop()
-        else:
-            logger.warn("Empty residuals detected.")
-        return original_output
+        return self.original_layer(*args, **kwargs) + self.extra_residuals()
+
+
+class AdapterRunner:
+    def __init__(
+        self,
+        hidden_states: List[List[torch.Tensor]],
+        weight: float = 1.0,
+    ) -> None:
+        self.hidden_states = (h for h in hidden_states)
+        self.weight = weight
+        self.adapter = Script.adapter
+        assert self.adapter is not None
+
+        # Output of X-Adapter, which should be add back to main pass up block
+        # outputs.
+        self.adapter_output = []
+
+    def run(self) -> torch.Tensor:
+        if not self.adapter_output:
+            self.adapter_output = self.adapter(next(self.hidden_states))
+        return self.adapter_output.pop(0) * self.weight
+
+
+def hook_up_layers(
+    output_blocks: List[torch.nn.Module],
+    sd15_hidden_states: List[List[torch.Tensor]],
+    weight: float = 1.0,
+) -> List[torch.nn.Module]:
+    assert Script.adapter is not None
+    runner = AdapterRunner(sd15_hidden_states, weight=weight)
+    return [
+        ResidualModifier(block, extra_residuals=runner.run) for block in output_blocks
+    ]
 
 
 class Script(scripts.Script):
@@ -143,6 +173,8 @@ class Script(scripts.Script):
             processed = process_images(p2)
         finally:
             p2.close()
+            # Reload main pass sd model after we are done with sd15 pass.
+            sd_models.reload_model_weights()
         return processed
 
     def process(self, p: StableDiffusionProcessing, *args):
@@ -172,6 +204,7 @@ class Script(scripts.Script):
                 ]
             ):
                 hook_module_input(layer, i, self.hidden_states)
+            logger.info("Preprocess pass output blocks hooked.")
         else:
             Script.run_sd15(p, adapter_args)
             # SDXL pass.
@@ -179,32 +212,24 @@ class Script(scripts.Script):
             if Script.adapter is None:
                 Script.adapter = load_xadapter(MODEL_FILE)
                 Script.adapter.to(device="cuda")
-            hidden_states_by_timesteps = []
             # Convert defaultdict to matrix.
             hidden_statess = [
                 self.hidden_states[i] for i in range(len(self.hidden_states))
             ]
-            # Transpose the matrix.
-            for hidden_states in zip(*hidden_statess):
-                assert (
-                    len(hidden_states) == 3
-                ), "Should collect last three up blk in SD1.5"
-                # hidden states tensor * num of blocks
-                hidden_states_by_timesteps.append(Script.adapter(hidden_states))
-            # Transpose back.
-            hidden_states_by_blocks = list(zip(*hidden_states_by_timesteps))
-
             sd_ldm = p.sd_model
             unet = sd_ldm.model.diffusion_model
-            new_output_blocks = torch.nn.ModuleList()
-            for hidden_states, block in zip(
-                unet.output_blocks,
-                hidden_states_by_blocks,
-            ):
-                new_output_blocks.append(
-                    UpLayerModifier(block, extra_residuals=hidden_states[::-1])
+            unet.middle_block, unet.output_blocks[2], unet.output_blocks[5] = (
+                hook_up_layers(
+                    # Expected layer output shapes.
+                    # (1280, 32, 32), (1280, 64, 64), (640, 128, 128)
+                    [unet.middle_block, unet.output_blocks[2], unet.output_blocks[5]],
+                    sd15_hidden_states=list(
+                        zip(*hidden_statess)
+                    ),  # Transpose the matrix.
+                    weight=adapter_args.weight,
                 )
-            unet.output_blocks = new_output_blocks
+            )
+            logger.info("Main pass output blocks hooked.")
 
     def postprocess(self, p, processed, *args):
         """
